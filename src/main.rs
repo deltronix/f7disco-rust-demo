@@ -6,9 +6,14 @@ mod display_task;
 mod progress_bar;
 mod sdram_drv;
 
+use core::net::Ipv4Addr;
+
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{Stack, StackResources};
 use embassy_stm32::bind_interrupts;
+use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue};
 use embassy_stm32::fmc::Fmc;
 use embassy_stm32::gpio::{AfType, Flex, Level, Output, OutputType, Speed};
 use embassy_stm32::i2c::I2c;
@@ -17,12 +22,15 @@ use embassy_stm32::ltdc::{
     G3Pin, G4Pin, G5Pin, G6Pin, G7Pin, HsyncPin, Ltdc, LtdcConfiguration, PolarityActive,
     PolarityEdge, R0Pin, R1Pin, R2Pin, R3Pin, R4Pin, R5Pin, R6Pin, R7Pin, VsyncPin,
 };
+use embassy_stm32::peripherals::ETH;
+use embassy_stm32::rng::Rng;
 use embassy_stm32::time::mhz;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer};
 
 extern crate alloc;
 use embedded_alloc::TlsfHeap as Heap;
+use static_cell::StaticCell;
 
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
@@ -33,12 +41,19 @@ static TOUCH_SIGNAL: embassy_sync::signal::Signal<ThreadModeRawMutex, ft5336::To
     embassy_sync::signal::Signal::new();
 
 bind_interrupts!(struct Irqs {
+    ETH => embassy_stm32::eth::InterruptHandler;
+    RNG => embassy_stm32::rng::InterruptHandler<embassy_stm32::peripherals::RNG>;
     I2C3_EV => embassy_stm32::i2c::EventInterruptHandler<embassy_stm32::peripherals::I2C3>;
     I2C3_ER => embassy_stm32::i2c::ErrorInterruptHandler<embassy_stm32::peripherals::I2C3>;
 });
 
+type Device = Ethernet<'static, ETH, GenericPhy>;
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, Device>) -> ! {
+    runner.run().await;
+}
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     use embassy_stm32::rcc::{
         AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllPDiv, PllPreDiv, PllQDiv,
         PllRDiv, PllSource, Sysclk,
@@ -129,7 +144,38 @@ async fn main(_spawner: Spawner) {
         HEAP.init(ram_ptr as usize, SDRAM_SIZE)
     };
 
-    // Configure the LTDC Pins
+    let mut rng = Rng::new(p.RNG, Irqs);
+    let mut seed = [0; 8];
+    rng.fill_bytes(&mut seed);
+    let seed = u64::from_le_bytes(seed);
+
+    let mac_addr = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+    let phy = GenericPhy::new_auto();
+
+    static PACKETS: StaticCell<PacketQueue<4, 4>> = StaticCell::new();
+    let device = Ethernet::new(
+        PACKETS.init(PacketQueue::<4, 4>::new()),
+        p.ETH,
+        Irqs,
+        p.PA1,
+        p.PA2,
+        p.PC1,
+        p.PA7,
+        p.PC4,
+        p.PC5,
+        p.PG13,
+        p.PG14,
+        p.PG11,
+        phy,
+        mac_addr,
+    );
+
+    let config = embassy_net::Config::dhcpv4(Default::default());
+
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let (stack, runner) =
+        embassy_net::new(device, config, RESOURCES.init(StackResources::new()), seed);
+
     const DATA_AF: AfType = AfType::output(OutputType::PushPull, Speed::Low);
 
     // R: PI15, PJ0..6, 8 bits
@@ -343,8 +389,16 @@ async fn main(_spawner: Spawner) {
         touch.chip_id(&mut i2c)
     );
 
+    spawner.spawn(net_task(runner)).unwrap();
+
+    stack.wait_config_up().await;
+
+    info!("Network task initialized");
+
+    // Configure the LTDC Pins
     // Start the display task
-    _spawner.spawn(display_task::display_task()).unwrap();
+    spawner.spawn(display_task::display_task()).unwrap();
+    spawner.spawn(socket(stack)).unwrap();
 
     let mut led = Output::new(p.PI1, Level::High, Speed::Low);
 
@@ -385,6 +439,37 @@ async fn main(_spawner: Spawner) {
             Err(e) => {
                 info!("Error detecting touch: {:?}", e);
             }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn socket(stack: Stack<'static>) {
+    let mut rx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 1024];
+
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+
+        socket.set_timeout(Some(Duration::from_secs(10)));
+
+        let remote_endpoint = (Ipv4Addr::new(192, 168, 2, 5), 8008);
+
+        info!("connecting...");
+        let r = socket.connect(remote_endpoint).await;
+        if let Err(e) = r {
+            info!("connect error: {:?}", e);
+            Timer::after_secs(1).await;
+            continue;
+        }
+        info!("connected!");
+        loop {
+            let r = socket.write(b"Hello\n").await;
+            if let Err(e) = r {
+                info!("write error: {:?}", e);
+                break;
+            }
+            Timer::after_secs(1).await;
         }
     }
 }

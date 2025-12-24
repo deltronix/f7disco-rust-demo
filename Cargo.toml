@@ -53,6 +53,7 @@ embedded-alloc = { version = "0.6.0" }
 embedded-layout = "0.4"
 kolibri-embedded-gui = { git = "https://github.com/Yandrik/kolibri", branch = "main" }
 ft5336 = { git = "https://github.com/ProfFan/ft5336", branch = "fan/event_type", version = "0.3.0" }
+static_cell = "2.1.1"
 
 [profile.release]
 debug = 2
