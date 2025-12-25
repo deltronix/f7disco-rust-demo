@@ -13,7 +13,7 @@ use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{Stack, StackResources};
 use embassy_stm32::bind_interrupts;
-use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue};
+use embassy_stm32::eth::{Ethernet, GenericPhy, PacketQueue, Sma};
 use embassy_stm32::fmc::Fmc;
 use embassy_stm32::gpio::{AfType, Flex, Level, Output, OutputType, Speed};
 use embassy_stm32::i2c::I2c;
@@ -150,7 +150,6 @@ async fn main(spawner: Spawner) {
     let seed = u64::from_le_bytes(seed);
 
     let mac_addr = [0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
-    let phy = GenericPhy::new_auto();
 
     static PACKETS: StaticCell<PacketQueue<4, 4>> = StaticCell::new();
     let device = Ethernet::new(
@@ -158,16 +157,16 @@ async fn main(spawner: Spawner) {
         p.ETH,
         Irqs,
         p.PA1,
-        p.PA2,
-        p.PC1,
         p.PA7,
         p.PC4,
         p.PC5,
         p.PG13,
         p.PG14,
         p.PG11,
-        phy,
         mac_addr,
+        p.ETH_SMA,
+        p.PA2,
+        p.PC1,
     );
 
     let config = embassy_net::Config::dhcpv4(Default::default());
@@ -389,7 +388,7 @@ async fn main(spawner: Spawner) {
         touch.chip_id(&mut i2c)
     );
 
-    spawner.spawn(net_task(runner)).unwrap();
+    spawner.spawn(net_task(runner).unwrap());
 
     stack.wait_config_up().await;
 
@@ -397,8 +396,9 @@ async fn main(spawner: Spawner) {
 
     // Configure the LTDC Pins
     // Start the display task
-    spawner.spawn(display_task::display_task()).unwrap();
-    spawner.spawn(socket(stack)).unwrap();
+    spawner.spawn(display_task::display_task().unwrap());
+    // spawner.spawn(tcp_socket(stack)).unwrap();
+    spawner.spawn(udp_socket(stack).unwrap());
 
     let mut led = Output::new(p.PI1, Level::High, Speed::Low);
 
